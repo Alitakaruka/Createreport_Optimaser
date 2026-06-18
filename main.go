@@ -5,126 +5,176 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"strconv"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/xuri/excelize/v2"
 )
 
+const fileNamePattern = "HVAC leads_Dated %s - %s"
+
 type Element struct {
-	Jobtype   string
-	Compation string
-	Catigoty  string
-	Month     time.Month
+	JobType  string
+	Campaign string
+	Category string
 }
 
-type Value struct {
-	Data map[string]int
-}
-
-func NewValue() *Value {
-	d := Value{}
-	d.Data = make(map[string]int)
-	return &d
-}
-
-var Result map[Element]int
-
-const formatStr = "HVAC leads_Dated %s - %s"
+type Stats map[time.Month]int
 
 func main() {
-	Result = make(map[Element]int)
-	reader, err := zip.OpenReader("files/f.zip")
-
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	// fmt.Printf("file: %v\n", file)
-	for _, f := range reader.File {
-		fmt.Printf("f.Name: %v\n", f.Name)
-		fileReader, err := f.Open()
-		if err != nil {
-			panic(err)
-		}
-		var start, end string
-
-		_, err = fmt.Sscanf(strings.TrimSuffix(f.Name, ".xlsx"), formatStr, &start, &end)
-
-		if err != nil {
-			panic(err.Error())
-		} else {
-			fmt.Printf("start: %v\n", start)
-			fmt.Printf("end: %v\n", end)
-		}
-
-		StartTime, err := time.Parse("01_02_06", start)
-		// EndTime, err := time.Parse("02_01_06", end)
-		parceFile(fileReader, StartTime.Month())
-	}
-
-	WriteToFile()
-}
-
-func parceFile(fileReader io.Reader, Month time.Month) {
-
-	f, err := excelize.OpenReader(fileReader)
-
+	result, err := processZip("files/f.zip")
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	if err := writeResult("Result.xlsx", result); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func processZip(zipPath string) (map[Element]Stats, error) {
+	result := make(map[Element]Stats)
+
+	reader, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+
+	for _, zf := range reader.File {
+		month, err := parseMonthFromFilename(zf.Name)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", zf.Name, err)
+		}
+
+		rc, err := zf.Open()
+		if err != nil {
+			return nil, err
+		}
+
+		if err := processExcel(rc, month, result); err != nil {
+			rc.Close()
+			return nil, err
+		}
+
+		rc.Close()
+	}
+
+	return result, nil
+}
+
+func parseMonthFromFilename(filename string) (time.Month, error) {
+	var start, end string
+
+	name := strings.TrimSuffix(filepath.Base(filename), ".xlsx")
+
+	if _, err := fmt.Sscanf(name, fileNamePattern, &start, &end); err != nil {
+		return 0, err
+	}
+
+	t, err := time.Parse("01_02_06", start)
+	if err != nil {
+		return 0, err
+	}
+
+	return t.Month(), nil
+}
+
+func processExcel(
+	r io.Reader,
+	month time.Month,
+	result map[Element]Stats,
+) error {
+
+	f, err := excelize.OpenReader(r)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
 
 	rows, err := f.GetRows("Sheet1")
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
-	// fmt.Printf("rows: %v\n", rows)
 	for _, row := range rows {
-		El := Element{Jobtype: row[1], Compation: row[3], Catigoty: row[4], Month: Month}
-
-		if _, ok := Result[El]; !ok {
-			Result[El] = 1
-		} else {
-			Result[El] = Result[El] + 1
+		if len(row) < 5 {
+			continue
 		}
 
+		el := Element{
+			JobType:  strings.TrimSpace(row[1]),
+			Campaign: strings.TrimSpace(row[3]),
+			Category: strings.TrimSpace(row[4]),
+		}
+
+		if result[el] == nil {
+			result[el] = make(Stats)
+		}
+
+		result[el][month]++
 	}
 
+	return nil
 }
 
-func WriteToFile() {
+func writeResult(output string, result map[Element]Stats) error {
 	f := excelize.NewFile()
+	defer f.Close()
 
-	f.SetCellValue("Sheet1", "A1", "Job Type")
-	f.SetCellValue("Sheet1", "B1", "Job Campaign")
-	f.SetCellValue("Sheet1", "C1", "Campaign Category")
+	const sheet = "Sheet1"
 
-	find := make(map[string]bool)
-	for key, _ := range Result {
-		if _, ok := find[key.Month.String()]; !ok {
-			find[key.Month.String()] = true
-			f.SetCellValue("Sheet1", strings.ToUpper(string(intToW(4+int(key.Month))))+strconv.Itoa(1), key.Month.String())
+	headers := []string{
+		"Job Type",
+		"Job Campaign",
+		"Campaign Category",
+	}
+
+	for i, h := range headers {
+		cell, _ := excelize.CoordinatesToCellName(i+1, 1)
+		f.SetCellValue(sheet, cell, h)
+	}
+
+	months := collectMonths(result)
+
+	for i, month := range months {
+		cell, _ := excelize.CoordinatesToCellName(i+4, 1)
+		f.SetCellValue(sheet, cell, month.String())
+	}
+
+	rowNum := 2
+
+	for el, stats := range result {
+		f.SetCellValue(sheet, fmt.Sprintf("A%d", rowNum), el.JobType)
+		f.SetCellValue(sheet, fmt.Sprintf("B%d", rowNum), el.Campaign)
+		f.SetCellValue(sheet, fmt.Sprintf("C%d", rowNum), el.Category)
+
+		for i, month := range months {
+			cell, _ := excelize.CoordinatesToCellName(i+4, rowNum)
+			f.SetCellValue(sheet, cell, stats[month])
+		}
+
+		rowNum++
+	}
+
+	return f.SaveAs(output)
+}
+
+func collectMonths(result map[Element]Stats) []time.Month {
+	found := make(map[time.Month]struct{})
+
+	for _, stats := range result {
+		for month := range stats {
+			found[month] = struct{}{}
 		}
 	}
 
-	counter := 2
-	for key, val := range Result {
-		f.SetCellValue("Sheet1", "A"+strconv.Itoa(counter), key.Jobtype)
-		f.SetCellValue("Sheet1", "B"+strconv.Itoa(counter), key.Compation)
-		f.SetCellValue("Sheet1", "C"+strconv.Itoa(counter), key.Catigoty)
-		f.SetCellValue("Sheet1", strings.ToUpper(string(intToW(4+int(key.Month))))+strconv.Itoa(counter), val)
-		counter++
+	months := make([]time.Month, 0, len(found))
 
+	for month := range found {
+		months = append(months, month)
 	}
 
-	if err := f.SaveAs("Result.xlsx"); err != nil {
-		log.Fatal(err)
-	}
-}
-
-func intToW(a int) rune {
-	return rune('a' + a - 1)
+	return months
 }
